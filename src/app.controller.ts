@@ -1,15 +1,11 @@
-import { Controller, Get, Render } from '@nestjs/common';
-import { ChatGateway } from './chat/chat.gateway';
+import { Controller, Get } from '@nestjs/common';
 
 @Controller()
 export class AppController {
-  constructor(private readonly chatGateway: ChatGateway) {}
+  constructor() {}
 
   @Get()
-  @Render('index')
-  root() {}
-
-  @Get('chat')
-  @Render('chat')
-  chat() {}
+  getHello(): string {
+    return 'Bem-vindo ao FaceChess API';
+  }
 }
