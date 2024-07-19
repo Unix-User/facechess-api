@@ -7,8 +7,13 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
 
+  let corsOrigin = configService.get<string>('CORS_ORIGIN') || 3001;
+  if (!corsOrigin) {
+    throw new Error('CORS_ORIGIN is not defined in the configuration');
+  }
+
   const corsOptions = {
-    origin: configService.get<string>('CORS_ORIGIN').split(','),
+    origin: String(corsOrigin).split(','),
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,

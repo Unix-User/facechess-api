@@ -1,5 +1,15 @@
-import { SubscribeMessage, WebSocketGateway, WebSocketServer, MessageBody, ConnectedSocket } from '@nestjs/websockets';
+import {
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
+  OnGatewayInit,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  MessageBody,
+  ConnectedSocket,
+} from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { PeerService } from './peerjs/peerjs.service';
 
 @WebSocketGateway({
   cors: {
@@ -9,11 +19,48 @@ import { Server, Socket } from 'socket.io';
     credentials: true,
   },
 })
-export class AppGateway {
+export class AppGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer()
   server: Server;
 
   private rooms: Map<string, any> = new Map();
+
+  constructor(private readonly peerService: PeerService) {}
+
+  afterInit(server: Server) {
+    console.log('WebSocket server initialized');
+    this.peerService.setServer(server);
+  }
+
+  handleConnection(client: Socket, ...args: any[]) {
+    console.log(`Client connected: ${client.id}`);
+  }
+
+  handleDisconnect(client: Socket) {
+    console.log(`Client disconnected: ${client.id}`);
+    const roomId = this.findRoomByPlayerId(client.id);
+    if (roomId) {
+      const room = this.rooms.get(roomId);
+      room.players--;
+      if (room.players === 0) {
+        this.rooms.delete(roomId);
+        console.log(`Room ${roomId} deleted as it is empty`);
+      } else {
+        const opponent = this.getOpponent(roomId, client.id);
+        if (opponent) {
+          this.server.to(opponent).emit('room', room);
+          this.server.to(opponent).emit('disconnected', client.id);
+        }
+        room.pid.forEach((value, key) => {
+          if (value === client.id) {
+            room.pid.set(key, null);
+          }
+        });
+      }
+    }
+  }
 
   @SubscribeMessage('join')
   handleJoin(@MessageBody() roomId: string, @ConnectedSocket() client: Socket): void {
@@ -22,8 +69,9 @@ export class AppGateway {
     
     client.join(newRoomId);
     
-    this.server.to(newRoomId).emit('room', this.rooms.get(newRoomId));
-    client.emit('player', { playerId, players: this.rooms.get(newRoomId).players, color, roomId: newRoomId });
+    const roomData = this.rooms.get(newRoomId);
+    this.server.to(newRoomId).emit('room', roomData);
+    client.emit('player', { playerId, players: roomData.players, color, roomId: newRoomId });
   }
 
   @SubscribeMessage('move')
@@ -47,6 +95,11 @@ export class AppGateway {
       }
     }
     client.emit('message-sent', msg);
+  }
+
+  @SubscribeMessage('peer-ready')
+  handlePeerReady(@ConnectedSocket() client: Socket, @MessageBody() data: any) {
+    this.peerService.handlePeerConnection(client, data);
   }
 
   private findOrCreateRoom(roomId: string, playerId: string): { roomId: string, color: string } {
