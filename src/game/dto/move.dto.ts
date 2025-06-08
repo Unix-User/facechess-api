@@ -26,4 +26,10 @@ export class MoveDto {
     description: 'Peça promovida, se for um movimento de promoção (q, r, b, n)',
   })
   promotion?: string;
+
+  @ApiProperty({
+    example: 'w',
+    description: 'Cor da peça movida ("w" para branco, "b" para preto)',
+  })
+  color: 'w' | 'b';
 }

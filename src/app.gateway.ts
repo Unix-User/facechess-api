@@ -13,6 +13,17 @@ import { PeerService } from './peerjs/peerjs.service';
 import { ApiTags, ApiOperation, ApiBody, ApiResponse } from '@nestjs/swagger';
 import { Logger } from '@nestjs/common';
 import { MoveDto } from './game/dto/move.dto';
+import { AiService } from './ai/ai.service';
+
+type PlayerSlots = Map<0 | 1, string | null>;
+
+interface Room {
+  players: number;
+  pid: PlayerSlots;
+  isAI: boolean;
+  moves: MoveDto[];
+  turn: 'w' | 'b';
+}
 
 @ApiTags('Game Gateway')
 @WebSocketGateway({
@@ -30,9 +41,13 @@ export class AppGateway
   server: Server;
 
   private readonly logger = new Logger(AppGateway.name);
-  private rooms: Map<string, any> = new Map();
+  private rooms: Map<number, Room> = new Map();
+  private nextRoomId = 1;
 
-  constructor(private readonly peerService: PeerService) {}
+  constructor(
+    private readonly peerService: PeerService,
+    private readonly aiService: AiService,
+  ) {}
 
   afterInit(server: Server) {
     this.logger.log('WebSocket server initialized');
@@ -46,23 +61,38 @@ export class AppGateway
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
     const roomId = this.findRoomByPlayerId(client.id);
-    if (roomId) {
+    if (roomId !== null) {
       const room = this.rooms.get(roomId);
-      room.players--;
-      if (room.players === 0) {
-        this.rooms.delete(roomId);
-        this.logger.log(`Room ${roomId} deleted as it is empty`);
-      } else {
-        const opponent = this.getOpponent(roomId, client.id);
-        if (opponent) {
-          this.server.to(opponent).emit('room', room);
-          this.server.to(opponent).emit('disconnected', client.id);
+      if (room) {
+        if (
+          room.isAI &&
+          (room.pid.get(0) === client.id || room.pid.get(1) === client.id)
+        ) {
+          this.rooms.delete(roomId);
+          this.logger.log(
+            `AI Room ${roomId} deleted as human player ${client.id} disconnected.`,
+          );
+          return;
         }
-        room.pid.forEach((value, key) => {
-          if (value === client.id) {
-            room.pid.set(key, null);
+
+        room.players--;
+        if (room.players <= 0) {
+          this.rooms.delete(roomId);
+          this.logger.log(`Room ${roomId} deleted as it is empty`);
+        } else {
+          const opponent = this.getOpponent(roomId, client.id);
+          if (opponent) {
+            if (opponent !== 'ai-player') {
+              this.server.to(roomId.toString()).emit('room', room);
+              this.server.to(opponent).emit('disconnected', client.id);
+            }
           }
-        });
+          if (room.pid.get(0) === client.id) {
+            room.pid.set(0, null);
+          } else if (room.pid.get(1) === client.id) {
+            room.pid.set(1, null);
+          }
+        }
       }
     }
   }
@@ -70,69 +100,279 @@ export class AppGateway
   @SubscribeMessage('join')
   @ApiOperation({
     summary: 'Evento WebSocket: Entra ou cria uma sala de jogo',
-    description: `Para testar:
-1. Conecte-se ao WebSocket.
-2. Envie o evento 'join' com o ID da sala desejada.
-3. Exemplo de payload: "sala-123"
-4. Resposta esperada: Eventos 'room' (com dados da sala) e 'player' (com dados do jogador, incluindo ID, cor e ID da sala) serão emitidos para o cliente. Se a sala for nova ou tiver menos de 2 jogadores, o cliente entrará nela.`,
   })
   @ApiBody({
     schema: {
       type: 'string',
-      example: 'sala-123',
-      description: 'ID da sala para entrar ou criar',
+      example: '123',
+      description:
+        'ID da sala para tentar entrar (opcional, numérico). Se vazio ou inválido, entra em uma sala disponível ou cria uma nova.',
     },
   })
   @ApiResponse({
     description:
-      'Após entrar na sala, os eventos "room" e "player" são emitidos para o cliente. Exemplo "room": { players: number, pid: { [index: string]: string | null } }. Exemplo "player": { playerId: string, players: number, color: "w" | "b", roomId: string }',
+      'Após entrar na sala, os eventos "room" e "player" são emitidos para o cliente. O ID da sala retornado será numérico.',
   })
   handleJoin(
-    @MessageBody() roomId: string,
+    @MessageBody() roomIdString: string,
     @ConnectedSocket() client: Socket,
   ): void {
     const playerId = client.id;
-    const { roomId: newRoomId, color } = this.findOrCreateRoom(
-      roomId,
-      playerId,
+    const { roomId, color } = this.findOrCreateRoom(roomIdString, playerId);
+
+    client.join(roomId.toString());
+
+    const roomData = this.rooms.get(roomId);
+    if (roomData) {
+      this.server.to(roomId.toString()).emit('room', {
+        ...roomData,
+        roomId,
+        playerSlots: Object.fromEntries(roomData.pid.entries()),
+      });
+      client.emit('player', {
+        playerId,
+        players: roomData.players,
+        color,
+        roomId,
+      });
+    } else {
+      this.logger.error(
+        `Room ${roomId} not found after creation/join attempt for player ${playerId}`,
+      );
+      client.emit('status', {
+        variant: 'danger',
+        message: 'Erro ao entrar na sala. Tente novamente.',
+      });
+    }
+  }
+
+  @SubscribeMessage('start-ai-game')
+  @ApiOperation({
+    summary: 'Evento WebSocket: Inicia uma partida contra a IA',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        playerColor: {
+          type: 'string',
+          example: 'w',
+          description: 'Cor desejada para o jogador humano ("w" ou "b")',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    description:
+      'Confirma o início da partida contra a IA através do evento "ai-game-started". O ID da sala retornado será numérico.',
+  })
+  async startAIGame(
+    @MessageBody() data: { playerColor: 'w' | 'b' },
+    @ConnectedSocket() client: Socket,
+  ): Promise<void> {
+    const playerId = client.id;
+    const playerColor = data.playerColor; // Human player's color
+    const aiColor = playerColor === 'w' ? 'b' : 'w'; // AI player's color
+    const AI_PLAYER_ID = 'ai-player';
+
+    this.logger.log(`Client ${playerId} requested AI game as ${playerColor}`);
+
+    for (const currentRoomStringId of client.rooms) {
+      if (currentRoomStringId === client.id) {
+        continue;
+      }
+
+      const numericRoomId = parseInt(currentRoomStringId, 10);
+      if (!isNaN(numericRoomId) && this.rooms.has(numericRoomId)) {
+        const roomToLeave = this.rooms.get(numericRoomId);
+        if (roomToLeave) {
+          roomToLeave.players--;
+          if (roomToLeave.players <= 0) {
+            this.rooms.delete(numericRoomId);
+            this.logger.log(
+              `Client ${playerId} left room ${numericRoomId} (now empty) when starting AI game.`,
+            );
+          } else {
+            if (roomToLeave.pid.get(0) === playerId) {
+              roomToLeave.pid.set(0, null);
+            } else if (roomToLeave.pid.get(1) === playerId) {
+              roomToLeave.pid.set(1, null);
+            }
+            this.logger.log(
+              `Client ${playerId} left room ${numericRoomId}. Players remaining: ${roomToLeave.players}.`,
+            );
+
+            const opponentInOldRoom = this.getOpponent(numericRoomId, playerId);
+            if (opponentInOldRoom && opponentInOldRoom !== AI_PLAYER_ID) {
+              this.server.to(opponentInOldRoom).emit('room', roomToLeave);
+              this.server.to(opponentInOldRoom).emit('disconnected', playerId);
+            }
+          }
+        }
+      }
+      client.leave(currentRoomStringId);
+    }
+
+    const aiRoomId = this.nextRoomId++;
+    this.rooms.set(aiRoomId, {
+      players: 2,
+      pid: new Map<0 | 1, string | null>([
+        [0, playerColor === 'w' ? playerId : AI_PLAYER_ID],
+        [1, playerColor === 'b' ? playerId : AI_PLAYER_ID],
+      ]),
+      isAI: true,
+      moves: [],
+      turn: 'w',
+    });
+
+    const room = this.rooms.get(aiRoomId);
+    if (!room) {
+      this.logger.error(
+        `Failed to create AI room ${aiRoomId} for player ${playerId}`,
+      );
+      client.emit('status', {
+        variant: 'danger',
+        message: 'Erro ao iniciar partida contra a IA. Tente novamente.',
+      });
+      return;
+    }
+
+    client.join(aiRoomId.toString());
+
+    this.logger.log(
+      `Player ${playerId} started AI game in room ${aiRoomId} as ${playerColor}. Room state initialized.`,
     );
 
-    client.join(newRoomId);
+    client.emit('room', {
+      roomId: aiRoomId,
+      players: room.players,
+      isAI: room.isAI,
+      playerSlots: Object.fromEntries(room.pid.entries()),
+    });
 
-    const roomData = this.rooms.get(newRoomId);
-    this.server.to(newRoomId).emit('room', roomData);
     client.emit('player', {
       playerId,
-      players: roomData.players,
-      color,
-      roomId: newRoomId,
+      players: room.players,
+      color: playerColor,
+      roomId: aiRoomId,
     });
+
+    client.emit('opponent-data', {
+      playerId: 'ai-player',
+      color: aiColor,
+      isAI: true,
+      pieceSet: 'standard',
+      pieceType: 'svg',
+    });
+
+    if (aiColor === 'w') {
+      this.logger.log(
+        `AI (White) is making the first move in room ${aiRoomId}`,
+      );
+      // Pass human player's color and AI player's color
+      this.processPlayerMove(aiRoomId, AI_PLAYER_ID, playerColor, aiColor);
+    }
+  }
+
+  private async processPlayerMove(
+    roomId: number,
+    playerId: string,
+    humanPlayerColor: 'w' | 'b', // Added human player's color
+    aiPlayerColor: 'w' | 'b', // Added AI player's color
+  ): Promise<void> {
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      this.logger.error(`Attempted to process move for invalid room ${roomId}`);
+      return;
+    }
+
+    const isAI = playerId === 'ai-player';
+    const currentFen =
+      'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+    if (isAI) {
+      this.logger.log(
+        `Sending AI move request for room ${roomId} with FEN: ${currentFen}`,
+      );
+      const { aiMove, chatMessage } = await this.aiService.getAIMove(
+        currentFen,
+        humanPlayerColor,
+        aiPlayerColor,
+      );
+
+      if (aiMove) {
+        room.moves.push(aiMove);
+        room.turn = room.turn === 'w' ? 'b' : 'w';
+        this.logger.log(
+          `AI move processed for room ${roomId}: ${aiMove.from}-${aiMove.to}. New turn: ${room.turn}`,
+        );
+        this.server.to(roomId.toString()).emit('move-received', aiMove);
+      } else {
+        this.logger.warn(`AI did not return a valid move for room ${roomId}`);
+      }
+
+      if (chatMessage) {
+        this.server.to(roomId.toString()).emit('received-message', {
+          sender: 'ai-player',
+          text: chatMessage,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else {
+      this.logger.warn(
+        `processPlayerMove called for non-AI player ${playerId} in room ${roomId}. This should typically be handled by handleMove.`,
+      );
+    }
   }
 
   @SubscribeMessage('move')
-  @ApiOperation({
-    summary: 'Evento WebSocket: Envia um movimento de xadrez',
-    description: `Para testar:
-1. Conecte-se ao WebSocket.
-2. Entre em uma sala ('join' event).
-3. Envie o evento 'move' com os dados do movimento.
-4. Exemplo de payload: { "from": "e2", "to": "e4", "piece": "p", "promotion": null } (usando a estrutura de MoveDto)
-5. Resposta esperada: O evento 'move-received' com os dados do movimento será emitido para o oponente na mesma sala.`,
-  })
-  @ApiBody({ type: MoveDto })
-  @ApiResponse({
-    description:
-      'Encaminha o movimento para o oponente através do evento "move-received". O payload é o mesmo que o enviado (MoveDto). Exemplo: { "from": "e2", "to": "e4", "piece": "p", "promotion": null }',
-  })
   handleMove(
     @MessageBody() move: MoveDto,
     @ConnectedSocket() client: Socket,
   ): void {
-    const roomId = this.findRoomByPlayerId(client.id);
-    if (roomId) {
-      const opponent = this.getOpponent(roomId, client.id);
-      if (opponent) {
-        this.server.to(opponent).emit('move-received', move);
+    const playerId = client.id;
+    const roomId = this.findRoomByPlayerId(playerId);
+    if (!roomId || !this.rooms.has(roomId)) {
+      client.emit('status', {
+        variant: 'danger',
+        message: 'Sala não encontrada.',
+      });
+      return;
+    }
+
+    const room = this.rooms.get(roomId);
+    const playerSlot = Array.from(room.pid.entries()).find(
+      ([, id]) => id === playerId,
+    )?.[0];
+    const humanPlayerColor =
+      playerSlot === 0 ? 'w' : playerSlot === 1 ? 'b' : null;
+
+    if (room.turn !== humanPlayerColor) {
+      client.emit('status', {
+        variant: 'danger',
+        message: 'Não é o seu turno.',
+      });
+      return;
+    }
+
+    room.moves.push(move);
+    room.turn = humanPlayerColor === 'w' ? 'b' : 'w';
+
+    this.server.to(roomId.toString()).emit('move-received', move);
+
+    if (room.isAI) {
+      const opponentId = Array.from(room.pid.values()).find(
+        (id) => id !== playerId,
+      );
+      if (opponentId === 'ai-player') {
+        const aiPlayerColor = humanPlayerColor === 'w' ? 'b' : 'w';
+        // Pass human player's color and AI player's color
+        this.processPlayerMove(
+          roomId,
+          'ai-player',
+          humanPlayerColor,
+          aiPlayerColor,
+        );
       }
     }
   }
@@ -140,12 +380,6 @@ export class AppGateway
   @SubscribeMessage('send-message')
   @ApiOperation({
     summary: 'Evento WebSocket: Envia uma mensagem de chat',
-    description: `Para testar:
-1. Conecte-se ao WebSocket.
-2. Entre em uma sala ('join' event).
-3. Envie o evento 'send-message' com o conteúdo da mensagem.
-4. Exemplo de payload: "Olá, oponente!"
-5. Resposta esperada: O evento 'received-message' com a mensagem será emitido para o oponente. O evento 'message-sent' será emitido de volta para o remetente.`,
   })
   @ApiBody({
     schema: {
@@ -156,49 +390,61 @@ export class AppGateway
   })
   @ApiResponse({
     description:
-      'Encaminha a mensagem para o oponente através do evento "received-message" e envia de volta para o remetente através do evento "message-sent". Ambos os eventos têm o payload como a string da mensagem. Exemplo: "Olá, oponente!"',
+      'Encaminha a mensagem para o oponente (humano ou IA) e envia de volta para o remetente.',
   })
-  handleMessage(
+  async handleMessage(
     @MessageBody() msg: string,
     @ConnectedSocket() client: Socket,
-  ): void {
+  ): Promise<void> {
     const roomId = this.findRoomByPlayerId(client.id);
-    if (roomId) {
-      const opponent = this.getOpponent(roomId, client.id);
-      if (opponent) {
-        this.server.to(opponent).emit('received-message', msg);
+    if (roomId === null) {
+      this.logger.warn(`Message received from unknown player ${client.id}`);
+      return;
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      this.logger.error(`Room ${roomId} not found for player ${client.id}`);
+      return;
+    }
+
+    client.emit('message-sent', msg);
+
+    const opponent = this.getOpponent(roomId, client.id);
+    if (opponent) {
+      if (room.isAI && opponent === 'ai-player') {
+        this.logger.log(
+          `Human player ${client.id} sent message to AI in room ${roomId}: "${msg}"`,
+        );
+      } else {
+        this.server.to(opponent).emit('received-message', {
+          sender: client.id,
+          text: msg,
+          timestamp: new Date().toISOString(),
+        });
       }
     }
-    client.emit('message-sent', msg);
   }
 
   @SubscribeMessage('peer-ready')
   @ApiOperation({
     summary: 'Evento WebSocket: Informa que o PeerJS está pronto',
-    description: `Para testar:
-1. Conecte-se ao WebSocket
-2. Entre em uma sala
-3. Envie o evento 'peer-ready' com os dados
-4. Exemplo de payload: { "roomId": "sala-123", "peerId": "peer-456" }
-5. Resposta esperada:
-   - Conexão PeerJS configurada`,
   })
   @ApiBody({
     schema: {
       type: 'object',
       properties: {
-        roomId: { type: 'string', example: 'sala-123' },
+        roomId: { type: 'number', example: 123 },
         peerId: { type: 'string', example: 'peer-456' },
       },
     },
   })
   @ApiResponse({
-    description:
-      'Configura a conexão PeerJS para o cliente. Não há evento de resposta padrão, a configuração ocorre internamente.',
+    description: 'Configura a conexão PeerJS para o cliente.',
   })
   handlePeerReady(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: string; peerId: string },
+    @MessageBody() data: { roomId: number; peerId: string },
   ) {
     this.peerService.handlePeerConnection(client, data);
   }
@@ -206,111 +452,171 @@ export class AppGateway
   @SubscribeMessage('initiate-call')
   @ApiOperation({
     summary: 'Evento WebSocket: Inicia uma chamada de vídeo',
-    description: `Para testar:
-1. Conecte-se ao WebSocket
-2. Entre em uma sala
-3. Envie o evento 'initiate-call' com os dados
-4. Exemplo de payload: { "roomId": "sala-123", "peerId": "peer-456" }
-5. Resposta esperada:
-   - Evento 'incoming-call' para o oponente`,
   })
   @ApiBody({
     schema: {
       type: 'object',
       properties: {
-        roomId: { type: 'string', example: 'sala-123' },
+        roomId: { type: 'number', example: 123 },
         peerId: { type: 'string', example: 'peer-456' },
       },
     },
   })
   @ApiResponse({
     description:
-      'Notifica o oponente na sala através do evento "incoming-call". Payload: { callerId: string, peerId: string }. Exemplo: { "callerId": "clienteId1", "peerId": "peer-456" }',
+      'Notifica o oponente na sala através do evento "incoming-call".',
   })
   handleInitiateCall(
-    @MessageBody() data: { roomId: string; peerId: string },
+    @MessageBody() data: { roomId: number; peerId: string },
     @ConnectedSocket() client: Socket,
   ): void {
     const { roomId, peerId } = data;
     const opponent = this.getOpponent(roomId, client.id);
-    if (opponent) {
+    if (opponent && opponent !== 'ai-player') {
       this.server
         .to(opponent)
         .emit('incoming-call', { callerId: client.id, peerId });
-      this.logger.log(`Emitting incoming-call event to ${opponent}`);
+      this.logger.log(
+        `Emitting incoming-call event to ${opponent} in room ${roomId}`,
+      );
+    } else if (opponent === 'ai-player') {
+      this.logger.log(
+        `Player ${client.id} attempted to initiate call with AI in room ${roomId}. Ignoring.`,
+      );
+      client.emit('status', {
+        variant: 'info',
+        message: 'A IA não suporta chamadas de vídeo.',
+      });
     }
   }
 
   @SubscribeMessage('call-ended')
   @ApiOperation({
     summary: 'Evento WebSocket: Finaliza uma chamada de vídeo',
-    description: `Para testar:
-1. Conecte-se ao WebSocket.
-2. Entre em uma sala ('join' event).
-3. (Opcional: Inicie uma chamada com 'initiate-call').
-4. Envie o evento 'call-ended' com o ID da sala.
-5. Exemplo de payload: { "roomId": "sala-123" }
-6. Resposta esperada: O evento 'call-ended' com o ID do chamador será emitido para o oponente.`,
   })
   @ApiBody({
     schema: {
       type: 'object',
       properties: {
-        roomId: { type: 'string', example: 'sala-123' },
+        roomId: { type: 'number', example: 123 },
       },
     },
   })
   @ApiResponse({
-    description:
-      'Notifica o oponente na sala através do evento "call-ended". Payload: { callerId: string }. Exemplo: { "callerId": "clienteId1" }',
+    description: 'Notifica o oponente na sala através do evento "call-ended".',
   })
   handleCallEnded(
-    @MessageBody() data: { roomId: string },
+    @MessageBody() data: { roomId: number },
     @ConnectedSocket() client: Socket,
   ): void {
     const { roomId } = data;
     const opponent = this.getOpponent(roomId, client.id);
-    if (opponent) {
+    if (opponent && opponent !== 'ai-player') {
       this.server.to(opponent).emit('call-ended', { callerId: client.id });
-      this.logger.log(`Emitting call-ended event to ${opponent}`);
+      this.logger.log(
+        `Emitting call-ended event to ${opponent} in room ${roomId}`,
+      );
+    } else if (opponent === 'ai-player') {
+      this.logger.log(
+        `Player ${client.id} ended call with AI in room ${roomId}. Ignoring.`,
+      );
     }
   }
 
   private findOrCreateRoom(
-    roomId: string,
+    roomIdString: string,
     playerId: string,
-  ): { roomId: string; color: string } {
-    let found = false;
-    let newRoomId = roomId;
-    let color: string;
+  ): { roomId: number; color: 'w' | 'b' } {
+    let targetRoomId: number | null = null;
+    let color: 'w' | 'b';
 
-    for (const [id, room] of this.rooms.entries()) {
-      if (room.players < 2) {
-        newRoomId = id;
-        found = true;
-        break;
+    const requestedRoomNumber = parseInt(roomIdString, 10);
+    if (!isNaN(requestedRoomNumber) && this.rooms.has(requestedRoomNumber)) {
+      const room = this.rooms.get(requestedRoomNumber);
+      if (room && room.players < 2 && !room.isAI) {
+        targetRoomId = requestedRoomNumber;
+        this.logger.log(`Attempting to join specific room: ${targetRoomId}`);
+      } else if (room) {
+        this.logger.log(
+          `Room ${requestedRoomNumber} is not joinable (full or AI). Looking for available room.`,
+        );
+      } else {
+        this.logger.log(
+          `Input roomId "${roomIdString}" is not a valid numeric ID or room does not exist. Looking for available room.`,
+        );
+      }
+    } else if (roomIdString) {
+      this.logger.log(
+        `Input roomId "${roomIdString}" is not a valid numeric ID or room does not exist. Looking for available room.`,
+      );
+    } else {
+      this.logger.log(
+        `No specific roomId provided. Looking for available room.`,
+      );
+    }
+
+    if (targetRoomId === null) {
+      const existingRoomEntry = Array.from(this.rooms.entries()).find(
+        ([, room]) => room.players < 2 && !room.isAI,
+      );
+
+      if (existingRoomEntry) {
+        targetRoomId = existingRoomEntry[0];
+        this.logger.log(`Found available room: ${targetRoomId}`);
+      } else {
+        targetRoomId = this.nextRoomId++;
+        this.rooms.set(targetRoomId, {
+          players: 0,
+          pid: new Map<0 | 1, string | null>(),
+          isAI: false,
+          moves: [],
+          turn: 'w',
+        });
+        this.logger.log(`Created new room: ${targetRoomId}`);
       }
     }
 
-    if (!found) {
-      newRoomId = this.rooms.size.toString();
-      this.rooms.set(newRoomId, { players: 0, pid: new Map() });
+    const room = this.rooms.get(targetRoomId);
+    if (!room) {
+      this.logger.error(
+        `Failed to retrieve room ${targetRoomId} immediately after creation/selection.`,
+      );
+      throw new Error(`Internal server error: Room ${targetRoomId} not found.`);
     }
 
-    const room = this.rooms.get(newRoomId);
-    for (let i = 0; i < 2; i++) {
-      if (!room.pid.has(i)) {
-        room.pid.set(i, playerId);
-        color = i === 0 ? 'w' : 'b';
-        break;
+    if (!room.pid.has(0) || room.pid.get(0) === null) {
+      room.pid.set(0, playerId);
+      color = 'w';
+    } else if (!room.pid.has(1) || room.pid.get(1) === null) {
+      room.pid.set(1, playerId);
+      color = 'b';
+    } else {
+      this.logger.warn(
+        `Attempted to add player ${playerId} to full room ${targetRoomId}. Player might already be in room.`,
+      );
+      if (room.pid.get(0) === playerId) {
+        color = 'w';
+      } else if (room.pid.get(1) === playerId) {
+        color = 'b';
+      } else {
+        throw new Error(`Room ${targetRoomId} is full.`);
       }
     }
 
-    room.players++;
-    return { roomId: newRoomId, color };
+    const isPlayerAlreadyInRoom = Array.from(room.pid.values()).includes(
+      playerId,
+    );
+    if (!isPlayerAlreadyInRoom || room.players === 0) {
+      room.players++;
+    }
+
+    this.logger.log(
+      `Player ${playerId} joined room ${targetRoomId} as ${color}. Players in room: ${room.players}`,
+    );
+    return { roomId: targetRoomId, color };
   }
 
-  private findRoomByPlayerId(playerId: string): string | null {
+  private findRoomByPlayerId(playerId: string): number | null {
     for (const [roomId, room] of this.rooms.entries()) {
       if (room.pid.get(0) === playerId || room.pid.get(1) === playerId) {
         return roomId;
@@ -319,10 +625,17 @@ export class AppGateway
     return null;
   }
 
-  private getOpponent(roomId: string, playerId: string): string | null {
+  private getOpponent(roomId: number, playerId: string): string | null {
     const room = this.rooms.get(roomId);
     if (room) {
-      return room.pid.get(0) === playerId ? room.pid.get(1) : room.pid.get(0);
+      const player1Id = room.pid.get(0);
+      const player2Id = room.pid.get(1);
+
+      if (player1Id === playerId) {
+        return player2Id;
+      } else if (player2Id === playerId) {
+        return player1Id;
+      }
     }
     return null;
   }
