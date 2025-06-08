@@ -7,7 +7,6 @@ export class AppService {
   }
 
   handleJoin(roomId: string): string {
-    // Logic to handle joining a room
     return `Joined room ${roomId}`;
   }
 }
